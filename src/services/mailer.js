@@ -1,0 +1,109 @@
+const { Resend } = require('resend');
+const { loadConfig } = require('./smtpStore');
+
+let resend = null;
+
+function getClient() {
+  const key = process.env.RESEND_API_KEY;
+  if (!key) return null;
+  if (!resend) resend = new Resend(key);
+  return resend;
+}
+
+function getDefaultFrom() {
+  return process.env.RESEND_DEFAULT_FROM || '';
+}
+
+function getDefaultName() {
+  return process.env.RESEND_DEFAULT_NAME || 'ControlPeso';
+}
+
+// Remitente efectivo: config guardada desde la app (Mongo/archivo) o, si no
+// hay ninguna, la env var de respaldo. Así el servidor siempre puede enviar.
+function getEffectiveSender() {
+  const cfg = loadConfig();
+  if (cfg && cfg.fromEmail) {
+    return {
+      fromEmail: cfg.fromEmail,
+      fromName: cfg.fromName || getDefaultName(),
+      source: 'config',
+      updatedAt: cfg.updatedAt || null,
+    };
+  }
+  const envEmail = getDefaultFrom();
+  if (envEmail) {
+    return { fromEmail: envEmail, fromName: getDefaultName(), source: 'env', updatedAt: null };
+  }
+  return null;
+}
+
+async function sendMail({ to, subject, body, html, fromOverride, replyTo, headers }) {
+  const eff = getEffectiveSender();
+  const senderEmail = fromOverride || (eff && eff.fromEmail);
+  if (!senderEmail) {
+    const e = new Error('Remitente no configurado (guardá uno desde la app o setear RESEND_DEFAULT_FROM)');
+    e.code = 'NO_SENDER_CONFIGURED';
+    throw e;
+  }
+  const client = getClient();
+  if (!client) {
+    const e = new Error('El servidor no tiene RESEND_API_KEY configurada');
+    e.code = 'NO_RESEND_KEY';
+    throw e;
+  }
+
+  const fromName = (eff && eff.fromName) || getDefaultName();
+  const from = `"${fromName}" <${senderEmail}>`;
+  console.log(`[mailer] sending from="${from}" to=${to} subject="${subject}"`);
+
+  if (process.env.MOCK_MAIL === 'true') {
+    console.log(`[mock-mail][resend] to=${to} subject="${subject}" body_len=${body?.length || 0} html=${html ? 'yes' : 'no'}`);
+    return { messageId: 'mock-' + Date.now() };
+  }
+
+  try {
+    const payload = {
+      from,
+      to,
+      subject,
+      text: body,
+    };
+    // HTML opcional (correo de encuesta); el texto plano sigue siendo
+    // obligatorio para clientes que no renderizan HTML.
+    if (html && typeof html === 'string') payload.html = html;
+    // Responder a un buzón real mejora la reputación y evita señales de spam.
+    payload.replyTo = replyTo || senderEmail;
+    if (headers && typeof headers === 'object') payload.headers = headers;
+    const result = await client.emails.send(payload);
+    if (result?.error) {
+      const e = new Error(result.error.message || 'Resend rechazó el envío');
+      e.code = classifyResendError(result.error);
+      console.error(`[mailer] resend error to=${to} status=${result.error.statusCode} name=${result.error.name} msg=${result.error.message}`);
+      throw e;
+    }
+    console.log(`[mailer] sent via resend to=${to} id=${result?.data?.id}`);
+    return { messageId: result?.data?.id };
+  } catch (e) {
+    if (!e.code) e.code = 'SEND_ERROR';
+    console.error(`[mailer] sendMail FAIL to=${to} code=${e.code} msg=${e.message}`);
+    throw e;
+  }
+}
+
+function classifyResendError(err) {
+  const name = String(err?.name || '').toLowerCase();
+  const msg = String(err?.message || '').toLowerCase();
+  const status = err?.statusCode;
+  if (name.includes('validation') || status === 422) return 'RESEND_VALIDATION';
+  if (msg.includes('api key') || status === 401 || status === 403) return 'RESEND_AUTH';
+  if (msg.includes('domain') || msg.includes('from address') || msg.includes('not verified')) return 'RESEND_FROM_NOT_VERIFIED';
+  if (status === 429) return 'RESEND_RATE_LIMIT';
+  if (status >= 500) return 'RESEND_UPSTREAM';
+  return 'RESEND_ERROR';
+}
+
+function resetTransport() {
+  resend = null;
+}
+
+module.exports = { sendMail, resetTransport, getEffectiveSender };
