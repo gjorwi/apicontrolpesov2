@@ -227,26 +227,88 @@ async function sendSurveyToPatient({ patient, deviceId, backupId, date, source =
   }
 }
 
+// ------------------------------------------------- cola de envío (rate limit)
+// Máximo SEND_BATCH_SIZE correos cada SEND_INTERVAL_MS. Evita mandar todos de
+// golpe (Resend/Gmail lo rechazan o lo marcan como spam).
+
+const SEND_BATCH_SIZE = Math.max(1, Number(process.env.SURVEY_SEND_BATCH) || 5);
+const SEND_INTERVAL_MS = Math.max(1000, Number(process.env.SURVEY_SEND_INTERVAL_MS) || 30000);
+
+const sendQueue = new Map(); // key `${patientId}:${date}` -> job
+let sendTimer = null;
+let sendProcessing = false;
+
+function startSendProcessor() {
+  if (sendTimer) return;
+  sendTimer = setInterval(() => { void processSendQueue(); }, SEND_INTERVAL_MS);
+  if (sendTimer.unref) sendTimer.unref();
+  void processSendQueue();
+}
+
+function enqueueSurveySend(job) {
+  const key = `${job.patient?.id || '?'}:${job.date}`;
+  if (!sendQueue.has(key)) sendQueue.set(key, job);
+  startSendProcessor();
+}
+
+async function processSendQueue() {
+  if (sendProcessing) return;
+  if (sendQueue.size === 0) {
+    if (sendTimer) { clearInterval(sendTimer); sendTimer = null; }
+    return;
+  }
+  sendProcessing = true;
+  const batch = [];
+  for (const [key, job] of sendQueue) {
+    batch.push([key, job]);
+    if (batch.length >= SEND_BATCH_SIZE) break;
+  }
+  let sent = 0;
+  let skipped = 0;
+  let failed = 0;
+  try {
+    for (const [key, job] of batch) {
+      sendQueue.delete(key);
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const r = await sendSurveyToPatient(job);
+        if (r.ok) sent++;
+        else if (r.reason === 'send_failed') failed++;
+        else skipped++;
+      } catch (e) {
+        failed++;
+        console.error(`[survey-queue] error patient=${job.patient?.id}:`, e.message);
+      }
+    }
+  } finally {
+    sendProcessing = false;
+  }
+  console.log(`[survey-queue] lote=${batch.length} sent=${sent} skipped=${skipped} failed=${failed} pendientes=${sendQueue.size}`);
+  if (sendQueue.size === 0 && sendTimer) { clearInterval(sendTimer); sendTimer = null; }
+}
+
+function getSendQueueSize() {
+  return sendQueue.size;
+}
+
 // ------------------------------------------------- envío automático del día
 
+// Encola los envíos del día (no los manda todos de golpe): la cola procesa
+// como máximo SEND_BATCH_SIZE cada SEND_INTERVAL_MS.
 async function dispatchDay(date, cfg) {
   const patients = await listAllPatients();
-  const result = { total: patients.length, sent: 0, skipped: 0, failed: 0, noEmail: 0, already: 0 };
+  let queued = 0;
   for (const { patient, deviceId, backupId } of patients) {
-    try {
-      const r = await sendSurveyToPatient({ patient, deviceId, backupId, date, source: 'auto', cfg });
-      if (r.ok) result.sent++;
-      else if (r.reason === 'no_email') result.noEmail++;
-      else if (r.reason === 'already_sent' || r.reason === 'already_completed') result.already++;
-      else if (r.reason === 'send_failed') result.failed++;
-      else result.skipped++;
-    } catch (e) {
-      result.failed++;
-      console.error(`[survey] dispatch error patient=${patient.id}:`, e.message);
-    }
+    const email = String(patient?.email || '').trim();
+    if (!EMAIL_RE.test(email)) continue;
+    // eslint-disable-next-line no-await-in-loop
+    const invite = await surveyStore.getInvite(patient.id, date);
+    if (invite && (invite.status === 'sent' || invite.status === 'opened' || invite.status === 'completed')) continue;
+    enqueueSurveySend({ patient, deviceId, backupId, date, source: 'auto', cfg });
+    queued++;
   }
-  console.log(`[survey] dispatch ${date} sent=${result.sent} already=${result.already} noEmail=${result.noEmail} failed=${result.failed} skipped=${result.skipped}`);
-  return result;
+  console.log(`[survey] dispatch ${date} total=${patients.length} enqueued=${queued} cola=${sendQueue.size} (max ${SEND_BATCH_SIZE}/${SEND_INTERVAL_MS / 1000}s)`);
+  return { total: patients.length, queued, queue: sendQueue.size };
 }
 
 // ------------------------------------------------------ digest de pendientes
@@ -460,4 +522,6 @@ module.exports = {
   manualSend,
   buildLink,
   statusFor,
+  processSendQueue,
+  getSendQueueSize,
 };
